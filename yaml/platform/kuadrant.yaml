@@ -1,0 +1,34 @@
+# Kuadrant (from the Connectivity Link operator) is the policy engine on the MaaS gateway.
+# It deploys Authorino (checks API keys) and Limitador (enforces token quotas).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kuadrant-system
+---
+# Pre-create Authorino's Service so the service CA issues its TLS cert (authorino-server-cert).
+apiVersion: v1
+kind: Service
+metadata:
+  name: authorino-authorino-authorization
+  namespace: kuadrant-system
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: authorino-server-cert
+spec:
+  selector:
+    authorino-resource: authorino
+  ports:
+    - name: grpc
+      port: 50051
+      protocol: TCP
+    - name: http
+      port: 5001
+      protocol: TCP
+---
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: kuadrant-system
+spec:
+  observability:
+    enable: true

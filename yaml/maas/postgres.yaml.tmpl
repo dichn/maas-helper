@@ -1,0 +1,87 @@
+# PostgreSQL for maas-api (stores API keys). Single replica: fine for PoC, not for production.
+# Credentials come from postgres-creds, created by 'make enable-maas'.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: ${DB_NS}
+  labels:
+    app: postgres
+    app.kubernetes.io/managed-by: maas-helper   # disable-maas deletes only labeled objects
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: ${DB_NS}
+  labels:
+    app: postgres
+    app.kubernetes.io/managed-by: maas-helper
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: ${DB_NS}
+  labels:
+    app: postgres
+    app.kubernetes.io/managed-by: maas-helper
+    purpose: poc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: registry.redhat.io/rhel9/postgresql-16:latest
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRESQL_USER
+              valueFrom:
+                secretKeyRef: {name: postgres-creds, key: user}
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: postgres-creds, key: password}
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                secretKeyRef: {name: postgres-creds, key: database}
+          readinessProbe:
+            exec:
+              command: [/usr/libexec/check-container]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/pgsql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
