@@ -24,7 +24,7 @@ check:
 
 # ---------------------------------------------------------------- enable
 .PHONY: enable-maas
-enable-maas: check setup-kuadrant setup-gateway setup-postgres setup-dsc setup-telemetry health
+enable-maas: check setup-istio setup-kuadrant setup-gateway setup-postgres setup-dsc setup-telemetry health
 	@echo
 	@echo "🎉 MaaS is enabled"
 	@echo "   API:       https://$(MAAS_HOSTNAME)"
@@ -35,31 +35,44 @@ enable-maas: check setup-kuadrant setup-gateway setup-postgres setup-dsc setup-t
 	fi
 	@echo "   Next:      make deploy-sample-model test-maas"
 
+# Kuadrant only detects Istio when its operator starts, so Istio must be up before Kuadrant.
+# On OpenShift 4.19+ the first GatewayClass for the OpenShift controller is what installs Istio.
+.PHONY: setup-istio
+setup-istio:
+	@echo "== Istio (Gateway API provider, GatewayClass $(GATEWAY_CLASS)) =="
+	@if [ "$(GATEWAY_CLASS)" = "openshift-default" ]; then oc apply -f $(BASE)/yaml/platform/gatewayclass.yaml; fi
+	oc wait gatewayclass/$(GATEWAY_CLASS) --for=condition=Accepted --timeout=300s
+	oc wait --for=create crd/envoyfilters.networking.istio.io crd/wasmplugins.extensions.istio.io --timeout=300s
+	oc wait crd/envoyfilters.networking.istio.io crd/wasmplugins.extensions.istio.io --for=condition=Established --timeout=60s
+	@echo "✅ Istio ready"
+
 .PHONY: setup-kuadrant
-setup-kuadrant:
+setup-kuadrant: setup-istio
 	@echo "== Kuadrant (Authorino + Limitador) =="
 	oc apply -f $(BASE)/yaml/platform/kuadrant.yaml
 	oc wait --for=create authorino/authorino -n kuadrant-system --timeout=180s
 	@# MaaS talks to Authorino over TLS; trust the OpenShift service CA for outbound calls
 	oc patch authorino authorino -n kuadrant-system --type=merge \
 		-p '{"spec":{"listener":{"tls":{"enabled":true,"certSecretRef":{"name":"authorino-server-cert"}}}}}'
+	oc wait --for=create deployment/authorino -n kuadrant-system --timeout=180s
 	@# Only set env when missing, so a re-run does not restart Authorino
 	@oc set env deployment/authorino -n kuadrant-system --list | grep -q '^SSL_CERT_FILE=' || \
 		oc set env deployment/authorino -n kuadrant-system \
 			SSL_CERT_FILE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt \
 			REQUESTS_CA_BUNDLE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
-	@# If Kuadrant started before Istio it stays MissingDependency; a restart of its operator fixes it
+	@# If Kuadrant started before Istio it stays MissingDependency; a restart of its operator fixes it.
+	@# Delete the pod: OLM owns the deployment and reverts 'oc rollout restart'.
 	@if ! oc wait kuadrant/kuadrant -n kuadrant-system --for=condition=Ready --timeout=90s >/dev/null 2>&1; then \
 		echo "   Kuadrant not Ready, restarting kuadrant operator"; \
-		oc rollout restart deployment/kuadrant-operator-controller-manager -n openshift-operators; \
+		oc delete pod -n openshift-operators -l app=kuadrant,control-plane=controller-manager; \
+		oc rollout status deployment/kuadrant-operator-controller-manager -n openshift-operators --timeout=180s; \
 		oc wait kuadrant/kuadrant -n kuadrant-system --for=condition=Ready --timeout=300s; \
 	fi
 	@echo "✅ Kuadrant Ready"
 
 .PHONY: setup-gateway
-setup-gateway:
+setup-gateway: setup-istio
 	@echo "== MaaS gateway: https://$(MAAS_HOSTNAME) (class $(GATEWAY_CLASS), cert $(CERT_NAME)) =="
-	@if [ "$(GATEWAY_CLASS)" = "openshift-default" ]; then oc apply -f $(BASE)/yaml/platform/gatewayclass.yaml; fi
 	@# Never re-apply an existing gateway: changing it recreates the cloud load balancer
 	@if oc get gateway maas-default-gateway -n openshift-ingress >/dev/null 2>&1; then \
 		echo "   maas-default-gateway already exists, leaving it as is"; \

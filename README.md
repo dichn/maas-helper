@@ -48,12 +48,13 @@ make disable-maas                      # turn MaaS off
 | Step | Target | Why |
 | :--- | :--- | :--- |
 | 1 | `check` | Checks prerequisites and finds which DSC field holds the MaaS switch for your RHOAI version |
-| 2 | `setup-kuadrant` | Creates the Kuadrant CR (which deploys Authorino and Limitador) and enables Authorino TLS |
-| 3 | `setup-gateway` | Creates `maas-default-gateway` at `https://maas.<apps-domain>` |
-| 4 | `setup-postgres` | Creates PostgreSQL and its secrets; maas-api stores API keys there |
-| 5 | `setup-dsc` | Sets `kserve` and `aigateway.modelsAsAService` (3.5+) or `kserve.modelsAsService` (3.4) to `Managed` |
-| 6 | `setup-telemetry` | Turns on token usage metrics per user, group and model |
-| 7 | `health` | Calls `/maas-api/health` |
+| 2 | `setup-istio` | Creates the GatewayClass (which makes OpenShift 4.19+ install Istio) and waits for the Istio CRDs |
+| 3 | `setup-kuadrant` | Creates the Kuadrant CR (which deploys Authorino and Limitador) and enables Authorino TLS |
+| 4 | `setup-gateway` | Creates `maas-default-gateway` at `https://maas.<apps-domain>` |
+| 5 | `setup-postgres` | Creates PostgreSQL and its secrets; maas-api stores API keys there |
+| 6 | `setup-dsc` | Sets `kserve` and `aigateway.modelsAsAService` (3.5+) or `kserve.modelsAsService` (3.4) to `Managed` |
+| 7 | `setup-telemetry` | Turns on token usage metrics per user, group and model |
+| 8 | `health` | Calls `/maas-api/health` |
 
 `disable-maas` deletes the MaaS registrations, sets the DSC field to `Removed`, and deletes the gateway and the PostgreSQL objects maas-helper created (label `app.kubernetes.io/managed-by=maas-helper`). LLMInferenceServices are kept, and so are `kserve`/`aigateway`, which other features share. All API keys are lost: RHOAI deletes the MaaS subscriptions when MaaS is removed, which revokes their keys, so users mint new keys after a re-enable.
 `disable-maas FULL=true` also deletes Kuadrant, which leaves a cluster with only the operators installed.
@@ -72,7 +73,7 @@ make disable-maas                      # turn MaaS off
 - **DSC not Ready**: components MaaS doesn't use (for example trainer without the JobSet operator) can keep the DSC not Ready. `check` only warns; MaaS needs just KServe, plus AIGateway on 3.5.
 - **An operator fails to install**: `check` prints OLM's reason. A common one is `ResolutionFailed` when Authorino was installed at a different version than Connectivity Link expects; remove the separate Authorino subscription and let Connectivity Link pull in its own.
 - **A wait times out**: each step stops with the `oc wait` error. Re-run `make enable-maas`; finished steps are skipped.
-- **Kuadrant stuck `MissingDependency`**: Kuadrant started before Istio. `setup-kuadrant` restarts the Kuadrant operator automatically.
+- **Kuadrant stuck `MissingDependency`**: Kuadrant started before Istio. `setup-kuadrant` deletes the Kuadrant operator pod so it restarts and detects Istio. To do it by hand: `oc delete pod -n openshift-operators -l app=kuadrant,control-plane=controller-manager` (`oc rollout restart` does not work, because OLM reverts it).
 - **`llamastackoperator and ogx Managed`** (RHOAI 3.5): set `llamastackoperator` to `Removed` in the DSC, otherwise the MaaS CRDs never install.
 - **Health says the gateway is fine but the hostname fails** (HTTP 000/503): the gateway was re-created and got a new load balancer, and your DNS still has the old one cached. Wait a few minutes or flush your DNS cache.
 - **Gateway not `Programmed`**: the cluster has no LoadBalancer support (bare metal). Install MetalLB or expose the gateway through a Route.
