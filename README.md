@@ -50,7 +50,7 @@ make disable-maas                      # turn MaaS off
 | 1 | `check` | Checks prerequisites and finds which DSC field holds the MaaS switch for your RHOAI version |
 | 2 | `setup-istio` | Creates the GatewayClass (which makes OpenShift 4.19+ install Istio) and waits for the Istio CRDs |
 | 3 | `setup-kuadrant` | Creates the Kuadrant CR (which deploys Authorino and Limitador) and enables Authorino TLS |
-| 4 | `setup-gateway` | Creates `maas-default-gateway` at `https://maas.<apps-domain>` |
+| 4 | `setup-gateway` | Creates `maas-default-gateway` at `https://maas.<apps-domain>`; on re-runs updates its Service type (`GATEWAY_EXPOSE`) and pod sizing in place |
 | 5 | `setup-postgres` | Creates PostgreSQL and its secrets; maas-api stores API keys there |
 | 6 | `setup-dsc` | Sets `kserve` and `aigateway.modelsAsAService` (3.5+) or `kserve.modelsAsService` (3.4) to `Managed` |
 | 7 | `setup-telemetry` | Turns on token usage metrics per user, group and model |
@@ -65,6 +65,7 @@ make disable-maas                      # turn MaaS off
 | :--- | :--- | :--- |
 | `MAAS_HOSTNAME` | `maas.<apps-domain>` | Gateway hostname |
 | `CERT_NAME` | ingress default cert | TLS secret in `openshift-ingress` |
+| `GATEWAY_EXPOSE` | `loadbalancer` | `route`: ClusterIP gateway behind an OpenShift Route, for clusters without a load balancer ([misc/onprem-route.md](misc/onprem-route.md)) |
 | `FULL` | `false` | `disable-maas` also removes Kuadrant |
 | `YES` | empty | Set `YES=1` to skip the confirmation prompt |
 
@@ -76,5 +77,5 @@ make disable-maas                      # turn MaaS off
 - **Kuadrant stuck `MissingDependency`**: Kuadrant started before Istio. `setup-kuadrant` deletes the Kuadrant operator pod so it restarts and detects Istio. To do it by hand: `oc delete pod -n openshift-operators -l app=kuadrant,control-plane=controller-manager` (`oc rollout restart` does not work, because OLM reverts it).
 - **`llamastackoperator and ogx Managed`** (RHOAI 3.5): set `llamastackoperator` to `Removed` in the DSC, otherwise the MaaS CRDs never install.
 - **Health says the gateway is fine but the hostname fails** (HTTP 000/503): the gateway was re-created and got a new load balancer, and your DNS still has the old one cached. Wait a few minutes or flush your DNS cache.
-- **Gateway not `Programmed`**: the cluster has no LoadBalancer support (bare metal). Install MetalLB or expose the gateway through a Route.
+- **Gateway not `Programmed`**: the cluster has no LoadBalancer support (bare metal). Install MetalLB ([misc/onprem-metallb.md](misc/onprem-metallb.md)) or use `make enable-maas GATEWAY_EXPOSE=route` ([misc/onprem-route.md](misc/onprem-route.md)).
 - **HTTP codes**: `401` means the API key is missing or invalid. `403` means the key's subscription does not include the model. `429` means the token quota is used up.

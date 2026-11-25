@@ -1,26 +1,6 @@
 # The MaaS entry point: https://${MAAS_HOSTNAME}. Every model and the maas-api sit behind it.
 # Only namespaces labeled maas.opendatahub.io/gateway-access=true can attach routes.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: maas-gateway-options
-  namespace: openshift-ingress
-data:
-  # Gateway pod sizing; the default memory limit can OOM under load.
-  deployment: |
-    spec:
-      template:
-        spec:
-          containers:
-          - name: istio-proxy
-            resources:
-              requests:
-                cpu: 100m
-                memory: 256Mi
-              limits:
-                cpu: "2"
-                memory: 2Gi
----
+# Service type and pod sizing come from ConfigMap maas-gateway-options (gateway-options.yaml.tmpl).
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:

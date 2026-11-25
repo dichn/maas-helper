@@ -1,0 +1,26 @@
+# Settings for the gateway's Service and Deployment, read by Istio through the Gateway's infrastructure.parametersRef.
+# setup-gateway applies this on every run; Istio updates the existing Service and Deployment in place.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-gateway-options
+  namespace: openshift-ingress
+data:
+  # LoadBalancer (cloud, MetalLB) or ClusterIP (exposed through Route maas-gateway, GATEWAY_EXPOSE=route).
+  service: |
+    spec:
+      type: ${GATEWAY_SERVICE_TYPE}
+  # Gateway pod sizing; the default memory limit can OOM under load.
+  deployment: |
+    spec:
+      template:
+        spec:
+          containers:
+          - name: istio-proxy
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+              limits:
+                cpu: "2"
+                memory: 2Gi

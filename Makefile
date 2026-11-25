@@ -13,8 +13,18 @@ CLUSTER_DOMAIN=$(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domai
 MAAS_HOSTNAME=maas.$(CLUSTER_DOMAIN)
 # Gateway TLS: reuse the router's default certificate (secret in openshift-ingress)
 CERT_NAME=$(or $(shell oc get ingresscontroller default -n openshift-ingress-operator -o jsonpath='{.spec.defaultCertificate.name}' 2>/dev/null),router-certs-default)
-# OCP 4.22+ ships GatewayClass openshift-gateway-controller; older clusters get openshift-default from yaml/
-GATEWAY_CLASS=$(or $(shell oc get gatewayclass openshift-gateway-controller -o name 2>/dev/null | cut -d/ -f2),openshift-default)
+# The existing gateway's class; otherwise OCP 4.22+ may ship openshift-gateway-controller, older clusters get openshift-default from yaml/
+GATEWAY_CLASS=$(or $(shell oc get gateway maas-default-gateway -n openshift-ingress -o jsonpath='{.spec.gatewayClassName}' 2>/dev/null),$(shell oc get gatewayclass openshift-gateway-controller -o name 2>/dev/null | cut -d/ -f2),openshift-default)
+# loadbalancer: the gateway Service gets a cloud/MetalLB load balancer
+# route: ClusterIP gateway behind a passthrough Route (no load balancer needed)
+GATEWAY_EXPOSE=loadbalancer
+$(if $(filter loadbalancer route,$(GATEWAY_EXPOSE)),,$(error GATEWAY_EXPOSE must be loadbalancer or route, not '$(GATEWAY_EXPOSE)'))
+GATEWAY_SERVICE_TYPE=$(if $(filter route,$(GATEWAY_EXPOSE)),ClusterIP,LoadBalancer)
+# Service that Istio creates for the gateway
+GATEWAY_SVC=maas-default-gateway-$(GATEWAY_CLASS)
+# $(call render,<file>): a yaml/platform template filled in with the gateway settings
+render=MAAS_HOSTNAME=$(MAAS_HOSTNAME) CERT_NAME=$(CERT_NAME) GATEWAY_CLASS=$(GATEWAY_CLASS) GATEWAY_SVC=$(GATEWAY_SVC) GATEWAY_SERVICE_TYPE=$(GATEWAY_SERVICE_TYPE) \
+	envsubst '$${MAAS_HOSTNAME} $${CERT_NAME} $${GATEWAY_CLASS} $${GATEWAY_SVC} $${GATEWAY_SERVICE_TYPE}' < $(BASE)/yaml/platform/$(1)
 # Loads DSC, RHOAI_VERSION, MAAS_COMPONENT, MAAS_FIELD, MAAS_READY_COND, MAAS_API_NS, MAAS_STATE
 LOAD_ENV=set -euo pipefail; ENV=$$($(BASE)/scripts/check-dsc.sh env); eval "$$ENV"
 
@@ -27,7 +37,7 @@ check:
 enable-maas: check setup-istio setup-kuadrant setup-gateway setup-postgres setup-dsc setup-telemetry health
 	@echo
 	@echo "🎉 MaaS is enabled"
-	@echo "   API:       https://$(MAAS_HOSTNAME)"
+	@echo "   API:       https://$(MAAS_HOSTNAME) (gateway exposed by $(GATEWAY_EXPOSE))"
 	@if [ "$$(oc get datasciencecluster -o jsonpath='{.items[0].spec.components.dashboard.managementState}')" = "Managed" ]; then \
 		echo "   Dashboard: OpenShift AI -> Models as a Service"; \
 	else \
@@ -72,17 +82,26 @@ setup-kuadrant: setup-istio
 
 .PHONY: setup-gateway
 setup-gateway: setup-istio
-	@echo "== MaaS gateway: https://$(MAAS_HOSTNAME) (class $(GATEWAY_CLASS), cert $(CERT_NAME)) =="
+	@echo "== MaaS gateway: https://$(MAAS_HOSTNAME) ($(GATEWAY_EXPOSE), class $(GATEWAY_CLASS), cert $(CERT_NAME)) =="
+	@# Options (Service type, pod sizing) are always applied; Istio updates the existing Service in place
+	$(call render,gateway-options.yaml.tmpl) | oc apply -f -
 	@# Never re-apply an existing gateway: changing it recreates the cloud load balancer
-	@if oc get gateway maas-default-gateway -n openshift-ingress >/dev/null 2>&1; then \
-		echo "   maas-default-gateway already exists, leaving it as is"; \
-	else \
-		MAAS_HOSTNAME=$(MAAS_HOSTNAME) CERT_NAME=$(CERT_NAME) GATEWAY_CLASS=$(GATEWAY_CLASS) \
-		envsubst '$${MAAS_HOSTNAME} $${CERT_NAME} $${GATEWAY_CLASS}' \
-			< $(BASE)/yaml/platform/gateway.yaml.tmpl | oc apply -f -; \
-	fi
+	@oc get gateway maas-default-gateway -n openshift-ingress >/dev/null 2>&1 || $(call render,gateway.yaml.tmpl) | oc apply -f -
+	@# Hostname and cert live on the gateway, which is never re-applied
+	@actual=$$(oc get gateway maas-default-gateway -n openshift-ingress -o jsonpath='{.spec.listeners[0].hostname} {.spec.listeners[0].tls.certificateRefs[0].name}'); \
+	[ "$$actual" = "$(MAAS_HOSTNAME) $(CERT_NAME)" ] || { echo "❌ maas-default-gateway has hostname/cert '$$actual', not '$(MAAS_HOSTNAME) $(CERT_NAME)'. Run 'make disable-maas' first to change them."; exit 1; }
+	oc wait --for=create service/$(GATEWAY_SVC) -n openshift-ingress --timeout=120s
+	oc wait service/$(GATEWAY_SVC) -n openshift-ingress --for=jsonpath='{.spec.type}'=$(GATEWAY_SERVICE_TYPE) --timeout=120s
 	oc wait gateway/maas-default-gateway -n openshift-ingress --for=condition=Programmed --timeout=300s
-	@echo "✅ Gateway Programmed"
+ifeq ($(GATEWAY_EXPOSE),route)
+	@# OpenShift doesn't remove the DNS record it made for a former load balancer; it would bypass the router
+	oc delete dnsrecord -n openshift-ingress -l gateway.networking.k8s.io/gateway-name=maas-default-gateway --ignore-not-found
+	$(call render,gateway-route.yaml.tmpl) | oc apply -f -
+	oc wait route/maas-gateway -n openshift-ingress --timeout=120s --for=jsonpath='{.status.ingress[0].conditions[?(@.type=="Admitted")].status}'=True
+else
+	oc delete route maas-gateway -n openshift-ingress --ignore-not-found
+endif
+	@echo "✅ Gateway ready ($(GATEWAY_SERVICE_TYPE))"
 
 .PHONY: setup-postgres
 setup-postgres:
@@ -138,20 +157,25 @@ setup-telemetry:
 .PHONY: health
 health:
 	@echo "== maas-api health: https://$(MAAS_HOSTNAME)/maas-api/health =="
-	@# 1) Through the gateway's own address: proves the cluster side works, independent of DNS
-	@ADDR=$$(oc get gateway maas-default-gateway -n openshift-ingress -o jsonpath='{.status.addresses[0].value}' 2>/dev/null); \
-	[ -n "$$ADDR" ] || { echo "❌ maas-default-gateway has no address (run make enable-maas)"; exit 1; }; \
+	@# 1) Through the gateway's own address (or, in route mode, the router's): proves the cluster side works, independent of DNS
+	@if oc get route maas-gateway -n openshift-ingress >/dev/null 2>&1; then \
+		ADDR=$$(oc get route maas-gateway -n openshift-ingress -o jsonpath='{.status.ingress[0].routerCanonicalHostname}'); VIA="Route maas-gateway"; \
+	else \
+		ADDR=$$(oc get gateway maas-default-gateway -n openshift-ingress -o jsonpath='{.status.addresses[0].value}' 2>/dev/null); VIA="Gateway maas-default-gateway"; \
+	fi; \
+	[ -n "$$ADDR" ] || { echo "❌ $$VIA has no address yet (not admitted by the router / not Programmed; run make enable-maas)"; exit 1; }; \
 	for i in $$(seq 1 $(HEALTH_RETRIES)); do \
 		code=$$(curl -sk -o /dev/null -w '%{http_code}' --connect-to $(MAAS_HOSTNAME):443:$$ADDR:443 https://$(MAAS_HOSTNAME)/maas-api/health); \
-		case $$code in 200|401) echo "✅ Gateway ($$ADDR): HTTP $$code"; break;; esac; \
-		[ $$i = $(HEALTH_RETRIES) ] && { echo "❌ maas-api not reachable through the gateway (HTTP $$code)"; exit 1; }; \
-		echo "   HTTP $$code (load balancer may still be provisioning), retrying..."; sleep 10; \
+		case $$code in 200|401) echo "✅ $$VIA ($$ADDR): HTTP $$code"; break;; esac; \
+		[ $$i = $(HEALTH_RETRIES) ] && { echo "❌ maas-api not reachable through the $$VIA (HTTP $$code)"; exit 1; }; \
+		echo "   HTTP $$code (load balancer or route may still be provisioning), retrying..."; sleep 10; \
 	done
 	@# 2) Through public DNS: a re-created gateway gets a new load balancer, and resolvers may cache the old one
 	@code=$$(curl -sk -o /dev/null -w '%{http_code}' https://$(MAAS_HOSTNAME)/maas-api/health); \
 	case $$code in 200|401) echo "✅ https://$(MAAS_HOSTNAME): HTTP $$code";; \
 		*) echo "⚠️  https://$(MAAS_HOSTNAME) returns HTTP $$code from this machine, but the gateway is healthy."; \
-		   echo "   DNS here still points at an old load balancer; retry in a few minutes or flush your DNS cache.";; esac
+		   echo "   DNS here doesn't reach it yet: a cached old load balancer (retry later or flush your DNS cache),";\
+		   echo "   or no DNS record for a custom MAAS_HOSTNAME.";; esac
 
 # ---------------------------------------------------------------- disable
 .PHONY: disable-maas
@@ -177,6 +201,7 @@ disable-maas: check
 	echo "== Delete PostgreSQL created by maas-helper =="; \
 	oc delete deployment,service,secret,pvc -n "$$MAAS_API_NS" -l $(OWNED); \
 	echo "== Delete MaaS gateway and its policies =="; \
+	oc delete route maas-gateway -n openshift-ingress --ignore-not-found; \
 	oc delete gateway maas-default-gateway -n openshift-ingress --ignore-not-found; \
 	oc delete configmap maas-gateway-options -n openshift-ingress --ignore-not-found; \
 	oc delete authpolicy maas-gateway-auth -n openshift-ingress --ignore-not-found; \
@@ -203,6 +228,7 @@ status: check
 		&& oc get kuadrant,authorino,limitador -n kuadrant-system || echo "   (not installed)"
 	@echo "== Gateway =="
 	@oc get gateway maas-default-gateway -n openshift-ingress 2>/dev/null || echo "   (no maas-default-gateway)"
+	@oc get route maas-gateway -n openshift-ingress 2>/dev/null || true
 	@$(LOAD_ENV); echo "== maas-api / postgres ($$MAAS_API_NS) =="; \
 		oc get deployment maas-api postgres -n "$$MAAS_API_NS" 2>/dev/null || true
 	@echo "== Published models =="

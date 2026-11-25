@@ -1,0 +1,18 @@
+# GATEWAY_EXPOSE=route: no load balancer, the router forwards https://${MAAS_HOSTNAME} to the ClusterIP gateway.
+# Passthrough, so the gateway still terminates TLS with its own certificate.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: maas-gateway
+  namespace: openshift-ingress
+  labels:
+    app.kubernetes.io/managed-by: maas-helper
+spec:
+  host: ${MAAS_HOSTNAME}
+  to:
+    kind: Service
+    name: ${GATEWAY_SVC}
+  port:
+    targetPort: https
+  tls:
+    termination: passthrough
